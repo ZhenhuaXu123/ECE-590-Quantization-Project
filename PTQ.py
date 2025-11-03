@@ -18,7 +18,8 @@ from torch.ao.quantization import QConfigMapping, get_default_qconfig_mapping
 from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
 
 # ——————————— 配置区域 ———————————
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -86,6 +87,15 @@ def build_ptq_model(unet_fp32, device):
     with torch.inference_mode():
         for prompt in CALIBRATE_PROMPTS: #校准阶段跑的就是 “插入了 observer 的原模型（prepared）”
             _ = pipeline.generate([prompt], models={"diffusion": prepared}, seed=SEED, n_inference_steps=5, sampler=SAMPLER, device=device)
+            #pipeline.generate() 会“自动补齐”缺的子模型，所以能跑整条流水线
+#     在 pipeline.generate() 里，每个子模型都是这样取的：
+# clip      = models.get('clip')      or model_loader.load_clip(device)
+# encoder   = models.get('encoder')   or model_loader.load_encoder(device)
+# decoder   = models.get('decoder')   or model_loader.load_decoder(device)
+# diffusion = models.get('diffusion') or model_loader.load_diffusion(device)
+# 你传 models={"diffusion": prepared}：只把 U-Net/diffusion 换成你给的 prepared（带 observer）。
+# 其它 clip/encoder/decoder 都会由 model_loader 自动按需加载成 FP32。
+# generate() 还会创建噪声、做 tokenization → CLIP → 采样器循环（timestep / time_embedding）→ 调 diffusion → 调 decoder → 得到图像。
             # 运行过程中，每一层的prepared中的 observer 被喂入真实激活数据，min/max 被更新
     # Convert
     quant_ref = convert_fx(prepared)
@@ -163,10 +173,28 @@ def build_ptq_model(unet_fp32, device):
 # 模块融合（fuse）：经典 CNN 会在量化前把 Conv+BN+ReLU 融合；U-Net 常用 GroupNorm/SiLU，可融合空间有限。
 # 版本差异：PyTorch 1.13 的 FX 量化和 2.x 的 PT2E（prepare_pt2e/convert_pt2e）在 API 和产物上有差异；你的代码是FX 旧路径，能跑就继续，但想上 CUDA/int8 或更优内核时建议迁移 PT2E。
 
-def measure_model_stats(model):
+def measure_model_stats(model, name="model"):
+    """
+    统计模型参数数量 + 真实模型存储大小（通过 state_dict 序列化）
+    返回: (参数总数, 模型文件大小_MB)
+    """
+    import io
+    import torch #io 用于内存字节缓冲区（BytesIO）。torch 用于 save() 和访问 state_dict()。
+
+    # 统计参数数量
     total_params = sum(p.numel() for p in model.parameters())
-    size_bytes = sum(p.element_size() * p.numel() for p in model.parameters())
-    return total_params, size_bytes
+#     model.parameters() 迭代模型中所有可训练参数张量。
+# p.numel() 返回张量 p 的元素总数。
+# sum(...) 把所有参数的元素个数加总 = 参数总量（与 dtype 无关）。
+# 注意：量化前后参数个数不会变（结构不变时）。
+
+    # 统计 state_dict 实际大小（真实落盘大小，而不是 tensor 内存大小）
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)   # 模拟保存，不写入硬盘
+    size_mb = len(buffer.getvalue()) / (1024 * 1024)
+
+    print(f"[Stats] {name}: params={total_params:,}, size={size_mb:.2f} MB")
+    return total_params, size_mb
 
 def main():
     torch.manual_seed(SEED)
@@ -182,7 +210,15 @@ def main():
 
     # Build PTQ model
     print("Building PTQ model …")
-    unet_q = build_ptq_model(models["diffusion"], DEVICE)
+    unet_q = build_ptq_model(models["diffusion"], DEVICE) #pipeline.generate() 会“自动补齐”缺的子模型，所以能跑整条流水线
+#     在 pipeline.generate() 里，每个子模型都是这样取的：
+# clip      = models.get('clip')      or model_loader.load_clip(device)
+# encoder   = models.get('encoder')   or model_loader.load_encoder(device)
+# decoder   = models.get('decoder')   or model_loader.load_decoder(device)
+# diffusion = models.get('diffusion') or model_loader.load_diffusion(device)
+# 你传 models={"diffusion": prepared}：只把 U-Net/diffusion 换成你给的 prepared（带 observer）。
+# 其它 clip/encoder/decoder 都会由 model_loader 自动按需加载成 FP32。
+# generate() 还会创建噪声、做 tokenization → CLIP → 采样器循环（timestep / time_embedding）→ 调 diffusion → 调 decoder → 得到图像。
     models_ptq = models.copy()
     models_ptq["diffusion"] = unet_q
     params_ptq, size_ptq = measure_model_stats(unet_q)

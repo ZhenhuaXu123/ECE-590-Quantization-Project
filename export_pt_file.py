@@ -210,7 +210,8 @@ def main():
 # 你传 models={"diffusion": prepared}：只把 U-Net/diffusion 换成你给的 prepared（带 observer）。
 # 其它 clip/encoder/decoder 都会由 model_loader 自动按需加载成 FP32。
 # generate() 还会创建噪声、做 tokenization → CLIP → 采样器循环（timestep / time_embedding）→ 调 diffusion → 调 decoder → 得到图像。
-    torch.save(unet_q.state_dict(), "diffusion_int8.pt")
+    torch.save(unet_q.state_dict(), "diffusion_int8.pt") #保存数据
+    #torch.save(unet_q, "diffusion_int8_model.pt")  # ← 保存整个模型对象
     print("Saved quantized model to ckpt/diffusion_int8.pt")
 if __name__ == "__main__":
     main()

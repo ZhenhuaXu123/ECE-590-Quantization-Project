@@ -87,7 +87,7 @@ def build_ptq_model(unet_fp32, device):
     # 校准
     with torch.inference_mode():
         for prompt in CALIBRATE_PROMPTS: #校准阶段跑的就是 “插入了 observer 的原模型（prepared）”
-            _ = pipeline.generate([prompt], models={"diffusion": prepared}, seed=SEED, n_inference_steps=30, sampler=SAMPLER, device=device)
+            _ = pipeline.generate([prompt], models={"diffusion": prepared}, seed=SEED, n_inference_steps=10, sampler=SAMPLER, device=device)
             #pipeline.generate() 会“自动补齐”缺的子模型，所以能跑整条流水线
 #     在 pipeline.generate() 里，每个子模型都是这样取的：
 # clip      = models.get('clip')      or model_loader.load_clip(device)

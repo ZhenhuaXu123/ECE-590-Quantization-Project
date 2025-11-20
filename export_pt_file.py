@@ -34,7 +34,10 @@ SAMPLER = "k_lms"
 CFG_SCALE = 7.5  # 如果你的 pipeline 支持的话
 
 # 校准用 prompt（可以与评测 prompt 一致或略不同）
-CALIBRATE_PROMPTS = PROMPTS
+# 从生成的文件加载 200 条 prompt：
+with open("calibration_prompts.txt", "r", encoding="utf-8") as f:
+    CALIBRATE_PROMPTS = [line.strip() for line in f if line.strip()]
+
 
 # ——————————— 函数定义 ———————————
 def save_images(imgs, prefix: str):
@@ -86,7 +89,7 @@ def build_ptq_model(unet_fp32, device):
     # 校准
     with torch.inference_mode():
         for prompt in CALIBRATE_PROMPTS: #校准阶段跑的就是 “插入了 observer 的原模型（prepared）”
-            _ = pipeline.generate([prompt], models={"diffusion": prepared}, seed=SEED, n_inference_steps=5, sampler=SAMPLER, device=device)
+            _ = pipeline.generate([prompt], models={"diffusion": prepared}, seed=SEED, n_inference_steps=30, sampler=SAMPLER, device=device)
             #pipeline.generate() 会“自动补齐”缺的子模型，所以能跑整条流水线
 #     在 pipeline.generate() 里，每个子模型都是这样取的：
 # clip      = models.get('clip')      or model_loader.load_clip(device)
@@ -211,7 +214,7 @@ def main():
 # 其它 clip/encoder/decoder 都会由 model_loader 自动按需加载成 FP32。
 # generate() 还会创建噪声、做 tokenization → CLIP → 采样器循环（timestep / time_embedding）→ 调 diffusion → 调 decoder → 得到图像。
     torch.save(unet_q.state_dict(), "diffusion_int8.pt") #保存数据
-    #torch.save(unet_q, "diffusion_int8_model.pt")  # ← 保存整个模型对象
-    print("Saved quantized model to ckpt/diffusion_int8.pt")
+    # torch.save(unet_q, "diffusion_int8_model.pt")  # ← 保存整个模型对象
+    print("Saved quantized model to ckpt/diffusion_int8_update.pt")
 if __name__ == "__main__":
     main()

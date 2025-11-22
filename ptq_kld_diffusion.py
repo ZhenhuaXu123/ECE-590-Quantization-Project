@@ -37,12 +37,9 @@ N_STEPS = 30
 SAMPLER = "k_lms"
 CFG_SCALE = 7.5
 
-# 校准 prompts
-with open("calibration_prompts.txt", "r", encoding="utf-8") as f:
-    CALIBRATE_PROMPTS = [line.strip() for line in f if line.strip()]
-
+# ✅ 现在：校准就用上面这 3 个 prompt
+CALIBRATE_PROMPTS = PROMPTS
 CALIB_STEPS = 10                 # 每条 prompt 校准跑几步（只影响校准速度）
-MAX_CALIB_PROMPTS = len(CALIBRATE_PROMPTS)
 
 
 # ---------------- 工具函数 ----------------
@@ -149,15 +146,14 @@ class KLDObserver(ObserverBase):
         reduce_range=None,
         **kwargs
     ):
-        # ✅ 老 torch 的 ObserverBase 不认 qscheme/quant_min/...，所以只传 dtype
+        # 旧版 torch 的 ObserverBase 不认 qscheme/quant_min/...，所以只传 dtype
         super().__init__(dtype=dtype)
 
-        # ✅ 把老 FX 可能塞进来的 kwargs 全吞掉
         if qscheme is None:
             qscheme = torch.per_tensor_symmetric
         self.qscheme = qscheme
 
-        # ✅ FakeQuantize 必须能从 observer 上读到 quant_min/quant_max
+        # FakeQuantize 期望 observer 上有 quant_min / quant_max
         self.quant_min = -128 if quant_min is None else int(quant_min)
         self.quant_max = 127 if quant_max is None else int(quant_max)
         self.reduce_range = False if reduce_range is None else bool(reduce_range)
@@ -205,7 +201,6 @@ class KLDObserver(ObserverBase):
         return scale, zero_point
 
 
-
 # ---------------- build KLD-PTQ 模型 ----------------
 def build_ptq_model_kld(unet_fp32, device):
     unet = copy.deepcopy(unet_fp32).eval().to(device)
@@ -220,7 +215,6 @@ def build_ptq_model_kld(unet_fp32, device):
         bins=2048,
         num_quant=128,
     )
-
 
     # weight 用 per-channel minmax（默认）
     w_fake_quant = FakeQuantize.with_args(
@@ -241,7 +235,7 @@ def build_ptq_model_kld(unet_fp32, device):
     qmap = qmap.set_object_type(torch.nn.Conv2d, custom_qconfig) \
                .set_object_type(torch.nn.Linear, custom_qconfig)
 
-    # example inputs：保持你朴素 PTQ 的形式
+    # example inputs：保持你之前朴素 PTQ 的形式
     example_lat = torch.randn(
         1, 4,
         unet_fp32.latent_h, unet_fp32.latent_w,
@@ -256,9 +250,9 @@ def build_ptq_model_kld(unet_fp32, device):
         example_inputs=(example_lat, example_t, example_ctx)
     )
 
-    # ✅ 校准阶段只用 pipeline.generate（别手动 prepared(...)）
+    # 校准阶段只用 pipeline.generate
     with torch.inference_mode():
-        for idx, prompt in enumerate(CALIBRATE_PROMPTS[:MAX_CALIB_PROMPTS]):
+        for idx, prompt in enumerate(CALIBRATE_PROMPTS):
             _ = pipeline.generate(
                 [prompt],
                 models={"diffusion": prepared},
@@ -267,11 +261,49 @@ def build_ptq_model_kld(unet_fp32, device):
                 sampler=SAMPLER,
                 device=device,
             )
-            if (idx + 1) % 20 == 0:
-                print(f"[KLD-PTQ] Calibrated {idx+1}/{min(MAX_CALIB_PROMPTS, len(CALIBRATE_PROMPTS))} prompts")
+            print(f"[KLD-PTQ] Calibrated {idx+1}/{len(CALIBRATE_PROMPTS)} prompts")
 
     quant_ref = convert_fx(prepared)
     return quant_ref
+
+
+# ---------------- 导出压缩 int8 checkpoint ----------------
+def export_int8_checkpoint(model, path: str):
+    """
+    把模型的 state_dict 压成 int8 + scale：
+    - 对所有 float 权重做对称 per-tensor 量化，保存 int8 权重 + 一个 float32 scale
+    - 非 float 参数（比如缓冲区、BN 统计等）原样保存
+    这个文件不能直接 load_state_dict，到时候需要写一个反量化 loader。
+    """
+    state = model.state_dict()
+    int8_weights = {}
+    scales = {}
+    other = {}
+
+    for name, tensor in state.items():
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point() and tensor.numel() > 0:
+            w = tensor.cpu()
+            # 对称 per-tensor quant
+            s = w.abs().max() / 127.0
+            s = float(s.item()) if s > 0 else 1.0
+            s = max(s, 1e-8)
+            w_int8 = torch.clamp(torch.round(w / s), -127, 127).to(torch.int8)
+
+            int8_weights[name] = w_int8
+            scales[name] = torch.tensor(s, dtype=torch.float32)
+        else:
+            # 比如 bias、位置编码、缓冲区之类：原样保存（数量相对很少）
+            other[name] = tensor.cpu()
+
+    package = {
+        "int8_weights": int8_weights,
+        "scales": scales,
+        "other_tensors": other,
+    }
+    torch.save(package, path)
+
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    print(f"[Export] Saved compressed int8 checkpoint to {path}, size={size_mb:.2f} MB")
 
 
 # ---------------- main ----------------
@@ -280,24 +312,20 @@ def main():
     models = model_loader.preload_models(DEVICE)
 
     # Baseline
-    # print("Running baseline inference …")
-    # imgs_base = pipeline.generate(
-    #     PROMPTS, models=models, seed=SEED,
-    #     n_inference_steps=N_STEPS, sampler=SAMPLER, device=DEVICE
-    # )
-    # base_paths = save_images(imgs_base, "base")
+    print("Running baseline inference …")
+    imgs_base = pipeline.generate(
+        PROMPTS, models=models, seed=SEED,
+        n_inference_steps=N_STEPS, sampler=SAMPLER, device=DEVICE
+    )
+    base_paths = save_images(imgs_base, "base")
 
-    # unet_base = models["diffusion"]
-    # params_base, size_base = measure_model_stats(unet_base, "UNet_FP32")
-    # print(f"Baseline UNet params: {params_base}, size {size_base/1e6:.2f} MB")
+    unet_base = models["diffusion"]
+    params_base, size_base = measure_model_stats(unet_base, "UNet_FP32")
+    print(f"Baseline UNet params: {params_base}, size {size_base/1e6:.2f} MB")
 
     # Build KLD-PTQ model
     print("Building KLD-PTQ model …")
     unet_q = build_ptq_model_kld(models["diffusion"], DEVICE)
-
-    # ✅ 导出量化权重
-    torch.save(unet_q.state_dict(), "diffusion_int8_kld.pt")
-    print("Saved quantized UNet state_dict to diffusion_int8_kld.pt")
 
     models_ptq = models.copy()
     models_ptq["diffusion"] = unet_q
@@ -305,7 +333,10 @@ def main():
     params_ptq, size_ptq = measure_model_stats(unet_q, "UNet_KLD_PTQ")
     print(f"KLD-PTQ UNet params: {params_ptq}, size {size_ptq/1e6:.2f} MB")
 
-    # PTQ inference
+    # ✅ 导出压缩后的 INT8 checkpoint（大约是原来的 1/4 大小）
+    export_int8_checkpoint(unet_q, "diffusion_int8_kld_compressed.pt")
+
+    # KLD-PTQ inference（用 quant_ref 直接跑）
     print("Running KLD-PTQ inference …")
     t0 = time.time()
     imgs_ptq = pipeline.generate(
